@@ -4,9 +4,9 @@
 # Date: 28-02-2026
 ################################################################################
 
-
+library(car)
 library(glmnet)
-
+library(BART)
 
 data("ACTG175")
 data <- ACTG175
@@ -25,8 +25,7 @@ data$race     <- as.factor(data$race)
 data$gender   <- as.factor(data$gender)
 data$strat    <- as.factor(data$strat)
 data$symptom  <- as.factor(data$symptom)
-data$treat    <- as.factor(data$treat)
-
+data$treat    <- as.numeric(data$treat)
 
 #Defining functions:
 
@@ -91,12 +90,12 @@ ATECalculator_lm <- function(data, x, y, outcome,
   
   coef_lasso <- coef(fit)
   
-  ATE_lasso <- coef_lasso["treat1", ]
+  ATE_lasso <- coef_lasso["treat", ]
   
   vars <- rownames(coef_lasso)[coef_lasso[,1] != 0]
   vars <- vars[vars != "(Intercept)"]
   
-  vars_new <- unique(c(vars, "treat1"))
+  vars_new <- unique(c(vars, "treat"))
   
   formula_selected <- reformulate(vars_new, response = outcome)
   df <- data.frame(y,x)
@@ -104,7 +103,7 @@ ATECalculator_lm <- function(data, x, y, outcome,
   
   m <- lm(formula_selected, df)
   
-  ATE_post <- m$coefficients["treat1"]
+  ATE_post <- m$coefficients["treat"]
   
   return(list(ATE_post = ATE_post,
               ATE_lasso = ATE_lasso))
@@ -143,17 +142,15 @@ dual_permutation_test <- function(data, permut, outcome,
   
   A_col <- which(colnames(x) == "treat")
   
-  data_perm <- data
-  x_perm <- x
-  
   for (i in 1:permut) {
     
     if (i %% 1000 == 0) print(i)
     
     data_perm <- data
+    x_perm <- x
     
     if (testType == "perm") {
-      permuted <- c(sample(data$treat))
+      permuted <- sample(data$treat)
       data_perm$treat <- permuted
       x_perm[,A_col] <- permuted
       
@@ -177,8 +174,8 @@ dual_permutation_test <- function(data, permut, outcome,
     if (is.na(k_lasso[i])) k_lasso[i] <- 0
   }
   
-  p_post_lasso <- mean(abs(k_post_lasso) >= abs(post_lasso_or))
-  p_lasso <- mean(abs(k_lasso) >= abs(lasso_or))
+  p_post_lasso <- (1+sum(abs(k_post_lasso) >= abs(post_lasso_or)))/(permut+1)
+  p_lasso <- (1+sum(abs(k_lasso) >= abs(lasso_or)))/(permut+1)
   
   list(
     p_post_lasso = p_post_lasso,
@@ -201,7 +198,8 @@ dual_permutation_test <- function(data, permut, outcome,
 
 
 
-ATE_Calculator_logit <- function(data, x , y , type = c("CV", "BIC", "EBIC" , "AIC")) {
+ATE_Calculator_logit <- function(data, x , y , outcome,
+                                 type = c("CV", "BIC", "EBIC" , "AIC")) {
   
   type <- match.arg(type)
   
@@ -244,7 +242,7 @@ ATE_Calculator_logit <- function(data, x , y , type = c("CV", "BIC", "EBIC" , "A
   
   p.fac <- rep(1, ncol(x))
   p.fac[which(colnames(x) == "treat")] <- 0
-  
+  p.fac
   
   
   fit <- glmnet(x, y, alpha = 1, family = "binomial", lambda = lambda,
@@ -252,13 +250,15 @@ ATE_Calculator_logit <- function(data, x , y , type = c("CV", "BIC", "EBIC" , "A
   
   
   data1 <- data
-  data1$A <- 1
+  data1$treat <- 1
   
   data0 <- data
-  data0$A <- 0
+  data0$treat <- 0
   
-  x1 <- model.matrix(Y ~ ., data1)[, -1]
-  x0 <- model.matrix(Y ~ ., data0)[, -1]
+  form <- reformulate(".", response = outcome)
+  
+  x1 <- model.matrix(form, data1)[, -1]
+  x0 <- model.matrix(form, data0)[, -1]
   
   p1 <- predict(fit, newx = x1, s = lambda, type = "response")
   p0 <- predict(fit, newx = x0, s = lambda, type = "response")
@@ -270,9 +270,9 @@ ATE_Calculator_logit <- function(data, x , y , type = c("CV", "BIC", "EBIC" , "A
   vars <- rownames(coef_lasso)[coef_lasso[,1] != 0]
   vars <- vars[vars != "(Intercept)"]
   
-  vars_new <- unique(c(vars, "A"))
+  vars_new <- unique(c(vars, "treat"))
   
-  formula_selected <- reformulate(vars_new, response = "Y")
+  formula_selected <- reformulate(vars_new, response = outcome)
   
   fit <- glm(formula_selected,  family = "binomial", data = data)
   
@@ -294,26 +294,25 @@ ATE_Calculator_logit <- function(data, x , y , type = c("CV", "BIC", "EBIC" , "A
 
 
 
-dual_permutation_test_logit <- function(data, permut,
+dual_permutation_test_logit <- function(data, permut, outcome,
                                         testType = c("perm", "sem", "rand"),
                                         type = c("BIC", "CV", "EBIC", "AIC")) {
   testType <- match.arg(testType)
   type <- match.arg(type)
   n <- nrow(data)
   
-  x <- as.matrix(model.matrix(Y ~ ., data)[, -1])
-  y <- data$Y
+  form <- reformulate(".", response = outcome)
+  x <- model.matrix(form, data)[, -1]
+  y <- data[[outcome]]
   
-  or <- ATE_Calculator_logit(data, x, y, type)
+  or <- ATE_Calculator_logit(data, x, y, outcome, type)
   post_lasso_or <- or$ATE_post
   lasso_or <- or$ATE_lasso
   
   k_post_lasso <- numeric(permut)
   k_lasso <- numeric(permut)
   
-  A_col <- which(colnames(x) == "A")
-  
-  
+  A_col <- which(colnames(x) == "treat")
   
   for (i in 1:permut) {
     
@@ -323,22 +322,22 @@ dual_permutation_test_logit <- function(data, permut,
     x_perm <- x
     
     if (testType == "perm") {
-      permuted <- c(sample(data$A))
-      data_perm$A <- permuted
+      permuted <- sample(data$treat)
+      data_perm$treat <- permuted
       x_perm[,A_col] <- permuted
       
     } else if (testType == "sem") {
-      par <- mean(data$A)
+      par <- mean(data$treat)
       permuted <- c(rbinom(n, 1, par))
-      data_perm$A <- permuted
+      data_perm$treat <- permuted
       x_perm[,A_col] <- permuted
       
     } else if (testType == "rand") {
       permuted <- c(rbinom(n, 1, 0.5))
-      data_perm$A <- permuted
+      data_perm$treat <- permuted
       x_perm[,A_col] <- permuted
     }
-    perm <- ATE_Calculator_logit(data_perm, x_perm, y, type)
+    perm <- ATE_Calculator_logit(data_perm, x_perm, y, outcome, type)
     
     k_post_lasso[i] <- perm$ATE_post
     k_lasso[i] <- perm$ATE_lasso
@@ -347,8 +346,8 @@ dual_permutation_test_logit <- function(data, permut,
     if (is.na(k_lasso[i])) k_lasso[i] <- 0
   }
   
-  p_post_lasso <- mean(abs(k_post_lasso) >= abs(post_lasso_or))
-  p_lasso <- mean(abs(k_lasso) >= abs(lasso_or))
+  p_post_lasso <- (1+sum(abs(k_post_lasso) >= abs(post_lasso_or)))/(permut+1)
+  p_lasso <- (1+sum(abs(k_lasso) >= abs(lasso_or)))/(permut+1)
   
   list(
     p_post_lasso = p_post_lasso,
@@ -356,6 +355,14 @@ dual_permutation_test_logit <- function(data, permut,
   )
 }
 
+two_prop_z <- function(data, outcome){
+  n1 <- sum(data$treat == 1)
+  n0 <- sum(data$treat == 0)
+  
+  y1 <- sum(data[[outcome]][data$treat == 1] == 1)
+  y0 <- sum(data[[outcome]][data$treat == 0] == 1)
+  return(prop.test(x = c(y1, y0), n = c(n1, n0), correct = FALSE)$p.value)
+}
 
 
 
@@ -364,16 +371,13 @@ dual_permutation_test_logit <- function(data, permut,
 
 #---------------------Test cd420 lineair model----------------------------------
 data_cd4 <- data[,c("cd420", baseline_vars)]
-data <- data_cd4
 permutations <- 10000
-dual_permutation_test(data_cd4, permutations, "cd420", testType = "perm", 
-                      type=  "BIC")
+type<- "BIC"
+p <- dual_permutation_test(data_cd4, permutations, "cd420", testType = "rand", type)
 summary(lm(cd420 ~ treat, data_cd4))
-
-
-
-
-
+model_step<-step(lm(cd420 ~.,data_cd4))
+summary(model_step)
+p
 
 
 
@@ -386,4 +390,11 @@ summary(lm(cd420 ~ treat, data_cd4))
 
 
 #---------------------Test cens logistich model---------------------------------
-data_cd4 <- data[,c("cens", baseline_vars)]
+data_cens <- data[,c("cens", baseline_vars)]
+outcome<- "cens"
+permutations <- 10000
+type<- "BIC"
+dual_permutation_test_logit(data_cens, permutations, outcome, testType = "rand", type)
+two_prop_z(data_cens, outcome)
+
+

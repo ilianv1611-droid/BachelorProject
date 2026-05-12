@@ -596,6 +596,8 @@ type <- "BIC"
 tester.seedlm <- function(n, permut, type){
   LMrand <- simulateDataLMRand(n, bet0, bet1, k=3, meanX = 10, varX = 2)
   model <- lm(Y ~ ., data = LMrand)
+  p_full <- summary(model)$coefficients["A", "Pr(>|t|)"]
+  if(is.na(p_full)) p_full <- 0
   
   perm <- dual_permutation_test(LMrand, permutations, "perm", type)
   sem <- dual_permutation_test(LMrand, permutations, "sem", type)
@@ -608,7 +610,7 @@ tester.seedlm <- function(n, permut, type){
   
   p<- t(matrix(c(perm$p_lasso, sem$p_lasso, rand$p_lasso, perm$p_post_lasso,
                sem$p_post_lasso, rand$p_post_lasso,
-               summary(model)$coefficients["A", "Pr(>|t|)"], t.test(Y~A, data = LMrand)$p.value,
+               p_full, t.test(Y~A, data = LMrand)$p.value,
                perm_1_formula, sem_1_formula, rand_1_formula, post_lasso_coef_p(LMrand,type))))
   return(data.frame(p))
 }
@@ -684,6 +686,7 @@ print(resultsRandNorm)
 
 
 # ------ Wrapper for parallel ------
+n <- 15
 bet0<-0.1
 bet1<- 0.5
 alpha <- 0.05
@@ -694,6 +697,9 @@ type <- "BIC"
 tester.seedlm <- function(n, permut, type){
   LMrand <- simulateDataLMRand_Noise(n, bet0, bet1, k=3, meanX = 10, varX = 2)
   model <- lm(Y ~ ., data = LMrand)
+  m <- lm(Y ~ A + x1 + x2 + x3, data = LMrand)
+  p_full <- summary(model)$coefficients["A", "Pr(>|t|)"]
+  if(is.na(p_full)) p_full <- 0
   
   perm <- dual_permutation_test(LMrand, permutations, "perm", type)
   sem <- dual_permutation_test(LMrand, permutations, "sem", type)
@@ -706,13 +712,14 @@ tester.seedlm <- function(n, permut, type){
   
   p<- t(matrix(c(perm$p_lasso, sem$p_lasso, rand$p_lasso, perm$p_post_lasso,
                  sem$p_post_lasso, rand$p_post_lasso,
-                 summary(model)$coefficients["A", "Pr(>|t|)"], t.test(Y~A, data = LMrand)$p.value,
-                 perm_1_formula, sem_1_formula, rand_1_formula, post_lasso_coef_p(LMrand,type))))
+                 p_full, t.test(Y~A, data = LMrand)$p.value,
+                 perm_1_formula, sem_1_formula, rand_1_formula, post_lasso_coef_p(LMrand,type)
+                 , summary(m)$coefficients["A", "Pr(>|t|)"])))
   return(data.frame(p))
 }
 
 # ------ Parallel setup ------
-n.seed <- 1000
+n.seed <- 10
 
 params <- expand_grid(
   seed = 1:n.seed
@@ -747,12 +754,14 @@ stopCluster(cl)
 results.sim <- data.frame(do.call(rbind, resultsLMrand))
 colnames(results.sim) <- c("Perm_lasso", "Sem_Perm_lasso", "Rand_lasso" ,
                            "Perm_post_lasso", "Sem_Perm_post_lasso", "Rand_post_lasso", "cov_coef", "t_test",
-                           "Perm_1_form", "Sem_1_form", "Rand_1_form", "post_lasso_coef_p")
+                           "Perm_1_form", "Sem_1_form", "Rand_1_form", "post_lasso_coef_p",
+                            "true_coef")
 
 p_mean <- c(colMeans(results.sim[,], na.rm = TRUE))
 power <- colMeans(results.sim[, c("Perm_lasso", "Sem_Perm_lasso", "Rand_lasso" ,
                                   "Perm_post_lasso", "Sem_Perm_post_lasso", "Rand_post_lasso", "cov_coef", "t_test",
-                                  "Perm_1_form", "Sem_1_form", "Rand_1_form", "post_lasso_coef_p")]
+                                  "Perm_1_form", "Sem_1_form", "Rand_1_form", "post_lasso_coef_p",
+                                  "true_coef")]
                   <= alpha)
 
 resultsRandNorm <- if(bet1 ==0 ) data.frame( p_mean, type1 = power) else data.frame(p_mean, power)
@@ -766,79 +775,6 @@ print(resultsRandNorm)
 
 
 
-
-
-
-
-
-# ---------------------------- Exp LM parallell ------------------------------------------------------
-
-#Run at bet1 = 0 for type 1 error rate
-bet0<- 0.1
-bet1<- 0.3
-mu <- 10
-alpha <- 0.05
-permutations <- 50000
-
-#For bet1 = 0.3 and 50 000 permutations the power of Perm is the best with 0.23 (Sem/t_ = 0.20, Rand = 0.21) 
-#and the type1_error is the lowest for Sem with 0.17 (Perm = 0.18, Rand/t_ = 0.19)
-
-tester.seedlm <- function(n, permut){
-  LMexp <- simulateDataLMexp(n, bet0, bet1, mu)
-  model <- lm(Y ~ ., data = LMexp)
-  p<- t(matrix(c(testing_LM_lasso(LMexp,permutations, "perm"), testing_LM_lasso(LMexp,permutations, "sem"),
-                 testing_LM_lasso(LMexp,permutations, "rand"), testing_LM_post_lasso(LMexp,permutations, "perm"),
-                 testing_LM_post_lasso(LMexp,permutations, "sem"), testing_LM_post_lasso(LMexp,permutations, "rand"),
-                 summary(model)$coefficients["A", "Pr(>|t|)"])))
-  return(data.frame(p))
-}
-
-# ------ Parallel setup ------
-n.seed <- 100
-
-params <- expand_grid(
-  seed = 1:n.seed
-)
-param_list <- split(params, seq_len(nrow(params)))
-
-n_cores <- max(1, detectCores() - 2)
-cl <- makeCluster(n_cores)
-
-
-clusterEvalQ(cl, {
-  library(glmnet)
-  library(tidyverse)
-})
-
-
-clusterExport(
-  cl,
-  c("bet0","bet1", "mu", "alpha", "tester.seedlm", "simulateDataLMRand", "testing_LM_lasso", "testing_LM_post_lasso"
-    , "permutations", "n",  "covariateSelector", "ATE_Calculator_lm")
-)
-
-# ----- Run simulation -----
-
-resultsLMexp <- pblapply(param_list, cl = cl, FUN = function(param) {
-  set.seed(param$seed)
-  tester.seedlm(n = n, permut =  permutations)
-})
-
-stopCluster(cl)
-
-results.sim <- data.frame(do.call(rbind, resultsLMexp))
-colnames(results.sim) <- c("Perm", "Sem_Perm", "Rand" ,
-                           "Perm2", "Sem_Perm2", "Rand2", "cov_coef")
-
-p_mean <- c(colMeans(results.sim[,], na.rm = TRUE))
-power <- colMeans(results.sim[, c("Perm", "Sem_Perm", "Rand", "Perm2", "Sem_Perm2", "Rand2" , "cov_coef")] <= alpha)
-resultsRandexp <- data.frame( p_mean, power)
-
-results.sim <- data.frame(results.sim[, 0:4])
-results.sim$seed <- 1:n.seed
-rownames(results.sim) <- NULL
-
-head(resultsRand)
 
 
 
@@ -1094,14 +1030,14 @@ testing_Logit(data_logit1, permutations, "rand")
 
 # ------ Wrapper for parallel ------
 bet0<-0.1
-bet1<- 5
+bet1<- 0
 alpha <- 0.05
 permutations <- 10000
 type <- "BIC"
 
 
 tester.seed_logit <- function(n, permut, type){
-  LogRand <- simulateDataLog_Normal(n, bet0, bet1, k=3, meanX = 0, varX = 2)
+  LogRand <- simulateDataLog_Normal_Noise(n, bet0, bet1, k=3, meanX = 0, varX = 2)
   
   
   perm <- dual_permutation_test_logit(LogRand, permutations, "perm", type)
@@ -1115,7 +1051,7 @@ tester.seed_logit <- function(n, permut, type){
 }
 
 # ------ Parallel setup ------
-n.seed <- 1000
+n.seed <- 500
 
 params <- expand_grid(
   seed = 1:n.seed
@@ -1136,7 +1072,7 @@ clusterEvalQ(cl, {
 
 clusterExport(
   cl,
-  c("bet0","bet1", "alpha", "tester.seed_logit", "simulateDataLog_Normal", "dual_permutation_test_logit"
+  c("bet0","bet1", "alpha", "tester.seed_logit", "simulateDataLog_Normal_Noise", "dual_permutation_test_logit"
     , "permutations", "n", "ATE_Calculator_logit", "type", "two_prop_z")
 )
 
