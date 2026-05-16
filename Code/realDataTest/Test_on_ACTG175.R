@@ -7,6 +7,8 @@
 library(car)
 library(glmnet)
 library(BART)
+library(parallel)
+library(pbapply)
 
 data("ACTG175")
 data <- ACTG175
@@ -20,7 +22,7 @@ data$hemo     <- as.factor(data$hemo)
 data$homo     <- as.factor(data$homo)
 data$drugs    <- as.factor(data$drugs)
 data$oprior   <- as.factor(data$oprior)
-data$z30   <- as.factor(data$z30)
+data$z30      <- as.factor(data$z30)
 data$race     <- as.factor(data$race)
 data$gender   <- as.factor(data$gender)
 data$strat    <- as.factor(data$strat)
@@ -34,6 +36,7 @@ data$treat    <- as.numeric(data$treat)
 
 
 #ATE calculator for a linear model using BIC, CV and EBIC
+
 
 ATECalculator_lm <- function(data, x, y, outcome,
                              type = c("BIC", "CV", "EBIC")){
@@ -122,6 +125,8 @@ ATECalculator_lm <- function(data, x, y, outcome,
 
 #LASSO and post-LASSO p-values using permutation, semi-permutation or
 #randomization tests.
+
+
 dual_permutation_test <- function(data, permut, outcome,
                                   testType = c("perm", "sem", "rand"),
                                   type = c("BIC", "CV", "EBIC")) {
@@ -242,7 +247,6 @@ ATE_Calculator_logit <- function(data, x , y , outcome,
   
   p.fac <- rep(1, ncol(x))
   p.fac[which(colnames(x) == "treat")] <- 0
-  p.fac
   
   
   fit <- glmnet(x, y, alpha = 1, family = "binomial", lambda = lambda,
@@ -273,8 +277,17 @@ ATE_Calculator_logit <- function(data, x , y , outcome,
   vars_new <- unique(c(vars, "treat"))
   
   formula_selected <- reformulate(vars_new, response = outcome)
+  df <- data.frame(y,x)
+  colnames(df)[1] <- outcome
   
-  fit <- glm(formula_selected,  family = "binomial", data = data)
+  
+  fit <- glm(formula_selected,  family = "binomial", data = df)
+  
+  data1 <- df
+  data1$treat <- 1
+  
+  data0 <- df
+  data0$treat <- 0
   
   p1 <- predict(fit, newdata = data1,  type = "response")
   p0 <- predict(fit, newdata = data0, type = "response")
@@ -370,6 +383,11 @@ two_prop_z <- function(data, outcome){
 
 
 #---------------------Test cd420 lineair model----------------------------------
+
+
+# On full data
+
+
 data_cd4 <- data[,c("cd420", baseline_vars)]
 permutations <- 10000
 type<- "BIC"
@@ -380,6 +398,223 @@ summary(model_step)
 p
 
 
+# Selected model on 99.9% of the data
+
+
+
+  # Help function to ensure at least 1 of each factor is inside
+
+
+ensure_factor_levels <- function(data, prop = 0.01) {
+  
+  n <- nrow(data)
+  target_size <- floor(prop * n)
+  
+  mandatory_idx <- c()
+  
+  
+  factor_cols <- names(data)[sapply(data, is.factor)]
+  
+  for(col in factor_cols) {
+    
+    levs <- levels(data[[col]])
+    
+    for(lv in levs) {
+      
+      idx <- which(data[[col]] == lv)
+      
+      mandatory_idx <- c(mandatory_idx, sample(idx, 1))
+    }
+  }
+  
+  mandatory_idx <- unique(mandatory_idx)
+  
+  
+  remaining <- setdiff(seq_len(n), mandatory_idx)
+  
+  extra_needed <- max(0, target_size - length(mandatory_idx))
+  
+  extra_idx <- sample(remaining, extra_needed)
+  
+  test_idx <- c(mandatory_idx, extra_idx)
+  
+  train_idx <- setdiff(seq_len(n), test_idx)
+  
+  list(
+    train_data = data[train_idx, ],
+    test_data  = data[test_idx, ]
+  )
+}
+
+
+
+
+
+
+
+
+
+  # ATE calculator for selected model
+
+
+ATECalculator_lm_true_model <- function(data){
+  m   <- lm(cd420 ~ strat + treat + 
+              cd40, data= data)
+  ATE <- m$coefficients["treat"]
+  
+  return(ATE)
+}
+
+
+
+
+
+
+
+
+
+  # Permutation test for this model
+
+
+permutation_test_true_model <- function(data, permut,
+                                        testType = c("perm", "sem", "rand")) {
+  testType <- match.arg(testType)
+  n <- nrow(data)
+  
+  
+  or <- ATECalculator_lm_true_model(data)
+  
+  k <- numeric(permut)
+  
+  for (i in 1:permut) {
+    
+    if (i %% 1000 == 0) print(i)
+    
+    data_perm <- data
+    
+    if (testType == "perm") {
+      permuted <- c(sample(data[,"treat"]))
+      data_perm[,"treat"] <- permuted
+      
+    } else if (testType == "sem") {
+      par <- mean(data[,"treat"])
+      permuted <- c(rbinom(n, 1, par))
+      data_perm[,"treat"] <- permuted
+      
+    } else if (testType == "rand") {
+      permuted <- c(rbinom(n, 1, 0.5))
+      data_perm[,"treat"]<- permuted
+    }
+    k[i] <- ATECalculator_lm_true_model(data_perm)
+    
+    
+    if (is.na(k[i])) k[i] <- 0
+  }
+  
+  p <- mean(abs(k) >= abs(or))
+  
+  return(p)
+}
+
+
+
+
+
+
+
+
+
+# Parallell for prop = 0.02
+
+
+tester.seed <- function(data_cd4, prop = 0.02, permut = 10000){
+  split <- ensure_factor_levels(data_cd4, prop)
+  
+  train_data <- split$train_data
+  test_data  <- split$test_data
+  
+  
+  dualATE <- dual_permutation_test(test_data, permutations,"cd420", testType = "rand", "BIC")
+  trueATE <- permutation_test_true_model(test_data, 10000, "perm")
+  
+  p_LASSO      <-  dualATE$p_lasso
+  p_post_LASSO <- dualATE$p_post_lasso
+  
+  m       <-lm(cd420 ~ treat , data= test_data)
+  p_m     <-summary(m)$coefficients["treat", "Pr(>|t|)"]
+  
+  l      <-lm(cd420 ~ strat + treat + 
+                 cd40 + karnof , data= test_data)
+  p_l     <-summary(m)$coefficients["treat", "Pr(>|t|)"]
+  
+  
+  p <- data.frame(
+    p_LASSO      = p_LASSO,
+    p_post_LASSO = p_post_LASSO,
+    p_perm       = trueATE,
+    p_rlm        = p_m,
+    p_tlm        = p_l
+  )
+}
+
+
+
+n.seed <- 500
+prop   <- 0.02
+
+params <- expand_grid(
+  seed = 1:n.seed
+)
+param_list <- split(params, seq_len(nrow(params)))
+
+n_cores <- max(1, detectCores() - 2)
+cl <- makeCluster(n_cores)
+
+
+clusterEvalQ(cl, {
+  library(glmnet)
+  library(tidyverse)
+})
+
+
+clusterExport(cl, varlist = c(
+  "data_cd4",
+  "permutations",
+  "ensure_factor_levels",
+  "dual_permutation_test",
+  "permutation_test_true_model",
+  "tester.seed",
+  "ATECalculator_lm",
+  "ATECalculator_lm_true_model"
+))
+# ----- Run simulation -----
+
+resultsLMrand <- pblapply(param_list, cl = cl, FUN = function(param) {
+  tester.seed(data_cd4 = data_cd4, permut =  permutations)
+})
+
+stopCluster(cl)
+
+
+
+
+results.sim <- data.frame(do.call(rbind, resultsLMrand))
+colnames(results.sim) <- c("LASSO",
+                           "Post_LASSO",
+                           "Perm_true_model",
+                           "restricted_model",
+                           "true_model"
+)
+
+p_mean <- c(colMeans(results.sim[,], na.rm = TRUE))
+power <- colMeans(results.sim[, ]
+                  <= alpha)
+
+resultsRandNorm <- if(bet1 ==0 ) data.frame( p_mean, type1 = power) else data.frame(p_mean, power)
+
+rownames(results.sim) <- NULL
+
+print(resultsRandNorm)
 
 
 
@@ -390,6 +625,8 @@ p
 
 
 #---------------------Test cens logistich model---------------------------------
+
+
 data_cens <- data[,c("cens", baseline_vars)]
 outcome<- "cens"
 permutations <- 10000
@@ -398,3 +635,247 @@ dual_permutation_test_logit(data_cens, permutations, outcome, testType = "rand",
 two_prop_z(data_cens, outcome)
 
 
+
+
+
+
+
+
+
+# Selected model on 99.9% of the data
+
+
+
+# Help function to ensure at least 1 of each factor is inside
+
+
+ensure_factor_levels <- function(data, prop = 0.01) {
+  
+  n <- nrow(data)
+  target_size <- floor(prop * n)
+  
+  mandatory_idx <- c()
+  
+  
+  factor_cols <- names(data)[sapply(data, is.factor)]
+  
+  for(col in factor_cols) {
+    
+    levs <- levels(data[[col]])
+    
+    for(lv in levs) {
+      
+      idx <- which(data[[col]] == lv)
+      
+      mandatory_idx <- c(mandatory_idx, sample(idx, 1))
+    }
+  }
+  
+  mandatory_idx <- unique(mandatory_idx)
+  
+  
+  remaining <- setdiff(seq_len(n), mandatory_idx)
+  
+  extra_needed <- max(0, target_size - length(mandatory_idx))
+  
+  extra_idx <- sample(remaining, extra_needed)
+  
+  test_idx <- c(mandatory_idx, extra_idx)
+  
+  train_idx <- setdiff(seq_len(n), test_idx)
+  
+  list(
+    train_data = data[train_idx, ],
+    test_data  = data[test_idx, ]
+  )
+}
+
+
+
+
+
+
+
+
+
+# ATE calculator for selected model
+
+
+ATE_Calculator_logit_true_model <- function(data){
+  
+  fit <- glm(cens ~ treat + cd40 + cd80 + symptom,
+             family = binomial,
+             data)
+  
+  data1 <- data; data1[,"treat"] <- 1
+  data0 <- data; data0[,"treat"] <- 0
+  
+  p1 <- predict(fit, newdata = data1, type = "response")
+  p0 <- predict(fit, newdata = data0, type = "response")
+  return(mean(p1-p0))
+}
+
+
+
+
+
+
+
+
+
+# Permutation test for this model
+
+
+permutation_test_logit_true_model<- function(data, permut,
+                                             testType = c("perm", "sem", "rand")){
+  
+  n <- nrow(data)
+  
+  
+  k<- numeric(permut)
+  
+  ATE_or <- ATE_Calculator_logit_true_model(data)
+  for (i in 1:permut) {
+    
+    if (i %% 1000 == 0) print(i)
+    
+    data_perm <- data
+    
+    if (testType == "perm") {
+      permuted <- c(sample(data[,"treat"]))
+      data_perm[,"treat"] <- permuted
+      
+    } else if (testType == "sem") {
+      par <- mean(data[,"treat"])
+      permuted <- c(rbinom(n, 1, par))
+      data_perm[,"treat"] <- permuted
+      
+    } else if (testType == "rand") {
+      permuted <- c(rbinom(n, 1, 0.5))
+      data_perm[,"treat"] <- permuted
+    }
+    k[i] <- ATE_Calculator_logit_true_model(data_perm)
+    
+    if (is.na(k[i])) k[i] <- 0
+  }
+  return(mean(abs(k) >= abs(ATE_or)))
+}
+
+
+split <- ensure_factor_levels(data_cens, prop)
+
+train_data <- split$train_data
+test_data  <- split$test_data
+
+
+
+
+
+m <- glm(cens ~ ., family = binomial, data = train_data)
+
+step_model <- step(m)
+
+top4 <- rownames(
+  summary(step_model)$coefficients[-1, ]
+)[
+  order(summary(step_model)$coefficients[-1, "Pr(>|z|)"])[1:4]
+]
+top4
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Parallell for prop = 0.02
+
+
+tester.seed <- function(data, prop = 0.02, permut = 10000){
+  split <- ensure_factor_levels(data_cens, prop)
+  
+  train_data <- split$train_data
+  test_data  <- split$test_data
+  
+  
+  #dualATE <- dual_permutation_test_logit(test_data, permutations,"cens", testType = "perm", "BIC")
+  trueATE <- permutation_test_logit_true_model(test_data, 10000, "perm")
+  
+  two_p   <- two_prop_z(test_data, outcome)
+  
+  #p_LASSO      <-  dualATE$p_lasso
+  #p_post_LASSO <- dualATE$p_post_lasso
+  
+  
+  p <- data.frame(
+    #p_LASSO      = p_LASSO,
+    #p_post_LASSO = p_post_LASSO,
+    p_perm       = trueATE,
+    two_p        = two_p
+  )
+}
+
+
+
+n.seed <- 500
+prop   <- 0.02
+
+params <- expand_grid(
+  seed = 1:n.seed
+)
+param_list <- split(params, seq_len(nrow(params)))
+
+n_cores <- max(1, detectCores() - 2)
+cl <- makeCluster(n_cores)
+
+
+clusterEvalQ(cl, {
+  library(glmnet)
+  library(tidyverse)
+})
+
+
+clusterExport(cl, varlist = c(
+  "data_cens",
+  "permutations",
+  "ensure_factor_levels",
+  "dual_permutation_test_logit",
+  "permutation_test_logit_true_model",
+  "tester.seed",
+  "ATE_Calculator_logit_true_model",
+  "ATE_Calculator_logit",
+  "two_prop_z",
+  "outcome"
+))
+# ----- Run simulation -----
+
+resultsLMrand <- pblapply(param_list, cl = cl, FUN = function(param) {
+  tester.seed(data = data_cens, permut =  permutations)
+})
+
+stopCluster(cl)
+
+
+
+
+results.sim <- data.frame(do.call(rbind, resultsLMrand))
+colnames(results.sim) <- c("Perm_true_model",
+                           "two_prop"
+)
+
+p_mean <- c(colMeans(results.sim[,], na.rm = TRUE))
+power <- colMeans(results.sim[, ]
+                  <= alpha)
+
+resultsRandNorm <- if(bet1 ==0 ) data.frame( p_mean, type1 = power) else data.frame(p_mean, power)
+
+rownames(results.sim) <- NULL
+
+print(resultsRandNorm)
